@@ -5,9 +5,58 @@ void usage() {
     puts("sample : tcp-block ens33 \"Host: test.gilgil.net\"");
 }
 
+int get_attacker_mac(uint8_t *attacker_mac){
+    struct ifreq ifr;
+    struct ifconf ifc;
+    char buf[1024];
+    int success = 0;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock == -1){
+        return FAIL;
+    };
+
+    ifc.ifc_len = sizeof(buf);
+    ifc.ifc_buf = buf;
+    if (ioctl(sock, SIOCGIFCONF, &ifc) == -1) {
+        close(sock);
+        return FAIL;
+    }
+
+    struct ifreq* it = ifc.ifc_req;
+    const struct ifreq* const end = it + (ifc.ifc_len / sizeof(struct ifreq));
+
+    for (; it != end; ++it) {
+        strcpy(ifr.ifr_name, it->ifr_name);
+        if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0) {
+            if (! (ifr.ifr_flags & IFF_LOOPBACK)) { // don't count loopback
+                if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0) {
+                    success = 1;
+                    break;
+                }
+            }
+        }
+        else {
+            close(sock);
+            return FAIL;
+        }
+    }
+
+    if (success){
+        memcpy(attacker_mac, ifr.ifr_hwaddr.sa_data, MAC_SIZE);
+        close(sock);
+        return SUCCESS;
+    }
+    else{
+        close(sock);
+        return FAIL;
+    }
+}
+
 char pattern[128];
 int pat_len;
 pcap_t* handle;
+uint8_t attacker_mac[MAC_SIZE] = { 0 };
 
 int is_block(unsigned char* buf, int size) {
 	// Using KMP Algorithm
@@ -29,74 +78,132 @@ int is_block(unsigned char* buf, int size) {
 	}
 	return 0;
 }
-/*
-void send_arp_packet(uint8_t *ether_smac, uint8_t *ether_dmac, uint8_t *arp_sip, uint8_t *arp_smac, uint8_t *arp_tip, uint8_t *arp_tmac, uint8_t op){
-    memcpy(packet.eth.ether_dhost, ether_dmac, MAC_SIZE);
-    memcpy(packet.eth.ether_shost, ether_smac, MAC_SIZE);
 
-    packet.eth.ether_type = htons(ETHERTYPE_ARP);
-    packet.arp.ar_hrd = htons(ARPHRD_ETHER);
-    packet.arp.ar_pro = htons(PROTO_IPv4);
-    packet.arp.ar_hln = MAC_SIZE;
-    packet.arp.ar_pln = IP_SIZE;
-    packet.arp.ar_op = htons(op);
+void tcp_checksum(IPv4 * ip, TCP * tcp) {
+    pseudo_hdr * header = (pseudo_hdr *)malloc(sizeof(pseudo_hdr));
+    memcpy(header->sip, ip->ip_src, IP_SIZE);
+    memcpy(header->dip, ip->ip_dst, IP_SIZE);
+    header->reserved = 0x00;
+    header->proto = ip->ip_p;
+    header->tcp_len = htons(ntohs(ip->ip_len) - sizeof(IPv4));
+    tcp->th_sum = 0;
 
-    memcpy(packet.arp_.sip_addr, arp_sip, IP_SIZE);
-    memcpy(packet.arp_.smac_addr, arp_smac, MAC_SIZE);
-    memcpy(packet.arp_.tip_addr, arp_tip, IP_SIZE);
-    memcpy(packet.arp_.tmac_addr, arp_tmac, MAC_SIZE);
-
-    int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(ARP_PK));
-    
-    if (res != 0) {
-		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
-	}
-}*/
-
-void send_block_packet(TCP_PK packet){
-    printf("SEND BLOCK PACKET!! %d bytes\n", ntohs(packet.ip.ip_len)+LIBNET_ETH_H);
-    packet.tcp.th_seq += ntohs(packet.ip.ip_len);
-    packet.tcp.th_flags |= TH_RST;
-    pcap_inject(handle, reinterpret_cast<const u_char*>(&packet), ntohs(packet.ip.ip_len)+LIBNET_ETH_H);
-    /*
-    int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), ntohs(packet.ip.ip_len) + LIBNET_ETH_H);
-    if (res != 0) {
-		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
-	}
-    return;*/
+    uint32_t checksum = 0;
+    for(int i=0; i<sizeof(pseudo_hdr)/sizeof(uint16_t); i++) {
+        checksum += ntohs(*((uint16_t *)header+i));
+        checksum = (checksum & 0xFFFF) + (checksum >> 16);
+    }
+    for(int i=0; i<(tcp->th_off << 2)/sizeof(uint16_t); i++) {
+        checksum += *((uint16_t *)tcp+i);
+        checksum = (checksum & 0xFFFF) + (checksum >> 16);
+    }
+    free(header);
+    tcp->th_sum = (uint16_t)(~checksum);
+    return;
 }
 
-int analyze(const u_char* packet, unsigned int length){
-    printf("%d: %02x %02x %02x %02x\n", length, packet[0], packet[1], packet[2], packet[3]);
-    TCP_PK pk_hdr;
+void send_forward(const u_char* pkt_data, unsigned int length){
+    u_char packet[length] = { 0 };
+    memcpy(packet, pkt_data, length);
+    ETHERNET *eth = (ETHERNET *) packet;
+    IPv4 *ip = (IPv4 *)(packet+ETH_H);
+    TCP *tcp = (TCP *)(packet+ETH_H+ip->ip_hl*4);
+
+    // ETHERNET HEADER
+    // smac <- attacker mac
+    memcpy(eth->smac, attacker_mac, MAC_SIZE);
     
-    int offset = 0;
-    int eth_size = LIBNET_ETH_H;
-    memcpy(&(pk_hdr.eth), packet+offset, eth_size);
+    // TCP HEADER
+    tcp -> th_seq = htonl(ntohl(tcp->th_seq)+(ntohs(ip->ip_len) - ((ip->ip_hl*4)+((tcp->th_off) << 2))));
+    tcp->th_flags |= TH_RST;
 
-    offset += eth_size;
-    if(offset >= length)    return 0;
-    int ip_size = (packet[offset] & 0xf) << 2;
-    memcpy(&(pk_hdr.ip), packet+offset, ip_size);
+    // IP HEADER
+    ip->ip_len = (ip->ip_hl*4)+((tcp->th_off) << 2);
 
-    if(pk_hdr.ip.ip_p != 0x06){
+    // TCP CHECKSUM
+    tcp_checksum(ip, tcp);
+
+    int res = pcap_sendpacket(handle, (const u_char*)packet, ETH_H+ip->ip_len);
+    if (res != 0) {
+		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+	}
+}
+
+void send_backward(const u_char* pkt_data, unsigned int length){
+    u_char packet[length+0x10] = { 0 };
+    memcpy(packet, pkt_data, length);
+    ETHERNET *eth = (ETHERNET *) packet;
+    IPv4 *ip = (IPv4 *)(packet+ETH_H);
+    TCP *tcp = (TCP *)(packet+ETH_H+ip->ip_hl*4);
+    // ETHERNET HEADER
+    memcpy(eth->dmac, eth->smac, MAC_SIZE);
+    memcpy(eth->smac, attacker_mac, MAC_SIZE);
+
+    // TCP HEADER
+    uint16_t port = tcp->th_sport;
+    tcp->th_sport = tcp->th_dport;
+    tcp->th_dport = port;
+
+    int data_size = ntohs(ip->ip_len) - ((ip->ip_hl*4)+((tcp->th_off) << 2));
+    tcp -> th_seq = htonl(ntohl(tcp->th_seq)+data_size);
+    uint32_t val = ntohl(tcp->th_seq);
+    tcp->th_seq = tcp->th_ack;
+    tcp->th_ack = htonl(val);
+    tcp->th_flags |= TH_FIN;
+
+    // IP HEADER
+    ip->ip_len = (ip->ip_hl*4)+((tcp->th_off) << 2) + 11;
+    ip->ip_ttl = 128;
+    uint8_t ip_addr[IP_SIZE] = { 0 };
+    memcpy(ip_addr, ip->ip_src, IP_SIZE);
+    memcpy(ip->ip_src, ip->ip_dst, IP_SIZE);
+    memcpy(ip->ip_dst, ip_addr, IP_SIZE);
+
+    // TCP CHECKSUM
+    tcp_checksum(ip, tcp);
+
+    // DATA
+    u_char *data = (u_char *)(packet+ETH_H+ip->ip_hl*4+((tcp->th_off) << 2));
+    const u_char block_str[11] = "BLOCKED!!!";
+    memcpy(data, block_str, 10);
+
+    int res = pcap_sendpacket(handle, (const u_char*)packet, length);
+    if (res != 0) {
+		fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+	}
+}
+
+void send_block_packet(const u_char* pkt_data, unsigned int length){
+    // First, get attacker mac address.
+    get_attacker_mac(attacker_mac);
+
+    // Send Forward Block Packet
+    send_forward(pkt_data, length);
+
+    // Send Backward Block Packet
+    send_backward(pkt_data, length);
+}
+
+int analyze(const u_char* pkt_data, unsigned int length){
+    u_char packet[length] = { 0 };
+    memcpy(packet, pkt_data, length);
+
+    ETHERNET *eth = (ETHERNET *) packet;
+    IPv4 *ip = (IPv4 *)(packet+ETH_H);
+    TCP *tcp = (TCP *)(packet+ETH_H+ip->ip_hl*4);
+    int offset = ETH_H+ip->ip_hl * 4+((tcp->th_off) << 2);
+    if(ip->ip_p != PRO_TCP){
         //printf("not tcp packet\n");
         return 0;
     }
-
-    offset += ip_size;
-    if(offset >= length)    return 0;
-
-    int tcp_size = (packet[offset+12] >> 4) << 2;
-    memcpy(&(pk_hdr.tcp), packet+offset, tcp_size);
-
-    offset += tcp_size;
-    if(offset >= length)    return 0;
-
+    u_char *data = packet+offset;
     int data_size = length-offset;
-    memcpy(pk_hdr.data, packet+offset, data_size);
-    if(is_block(pk_hdr.data, data_size)){
-        send_block_packet(pk_hdr);
+    if(is_block(data, data_size)){
+        printf("%d\n", offset);
+        for(int i=0;i<length;i++){
+            printf("%02x ", packet[i]);
+        }
+        send_block_packet(packet, length);
     }
 }
 
